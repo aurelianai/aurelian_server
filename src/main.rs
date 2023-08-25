@@ -37,24 +37,27 @@ impl ModelManager {
             )
             .map_err(|e| e.to_string())
     }
-
-    pub fn model_eot_token(&mut self) -> u32 {
-        self.model.eot_token_id()
-    }
 }
 
 #[rocket::main]
 async fn main() -> Result<(), rocket::Error> {
-    let model_path = "C:\\Users\\Ethan\\Downloads\\llama-2-7b-chat.ggmlv3.q2_K.bin";
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        panic!("Must pass file path to ggml model!");
+    }
+    let model_path = std::path::Path::new(&args[1]);
+    if !model_path.exists() {
+        panic!("File cannot be found!");
+    }
 
     let model = llm::load_dynamic(
         Some(llm::ModelArchitecture::Llama),
-        std::path::Path::new(model_path),
+        model_path,
         llm::TokenizerSource::Embedded,
         Default::default(),
         llm::load_progress_callback_stdout,
     )
-    .expect(format!("Unable to load model at {}", model_path).as_ref());
+    .expect(format!("Unable to load model at {:?}", model_path.to_str()).as_ref());
 
     let session = model.start_session(Default::default());
 
