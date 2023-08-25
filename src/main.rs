@@ -1,14 +1,47 @@
-mod inference;
-
-use crate::inference::ModelManager;
 use rocket::{
     get,
-    response::stream::TextStream,
+    response::stream::{Event, EventStream},
     routes,
     serde::{json::Json, Deserialize, Serialize},
+    tokio::sync::mpsc,
     State,
 };
-use std::sync::Mutex;
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    thread,
+};
+
+pub struct ModelManager {
+    pub model: Box<dyn llm::Model>,
+    pub session: llm::InferenceSession,
+}
+
+impl ModelManager {
+    pub fn infer<F>(&mut self, prompt: &str, callback: F) -> Result<llm::InferenceStats, String>
+    where
+        F: FnMut(llm::InferenceResponse) -> Result<llm::InferenceFeedback, Infallible>,
+    {
+        self.session
+            .infer(
+                self.model.as_ref(),
+                &mut rand::thread_rng(),
+                &llm::InferenceRequest {
+                    prompt: llm::Prompt::Text(prompt),
+                    parameters: &llm::InferenceParameters::default(),
+                    play_back_previous_tokens: false,
+                    maximum_token_count: None,
+                },
+                &mut Default::default(),
+                callback,
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn model_eot_token(&mut self) -> u32 {
+        self.model.eot_token_id()
+    }
+}
 
 #[rocket::main]
 async fn main() -> Result<(), rocket::Error> {
@@ -28,7 +61,7 @@ async fn main() -> Result<(), rocket::Error> {
     let manager = ModelManager { model, session };
 
     let _rocket = rocket::build()
-        .manage(Mutex::new(manager))
+        .manage(Arc::new(Mutex::new(manager)))
         .mount("/", routes![health, complete])
         .launch()
         .await?;
@@ -56,17 +89,42 @@ struct CompletionUpdate {
 
 #[get("/complete", data = "<prompt>")]
 async fn complete<'r>(
-    _s: &'r State<Mutex<ModelManager>>,
+    s: &'r State<Arc<Mutex<ModelManager>>>,
     prompt: Json<CompletionRequest<'r>>,
-) -> TextStream![String + 'r] {
-    TextStream! {
-        let up = CompletionUpdate {delta: prompt.prompt.into(), err: None};
-        match serde_json::to_string(&up) {
-            Ok(s) => yield format!("data: {}", s),
-            Err(_) => {
-                yield String::from(r#"data: {"delta":"", "err": "Error occured during generation}"#);
-                return;
-            },
-        };
-    }
+) -> EventStream![Event + 'r] {
+    // TODO look into buffer sizes. This may be overkill or potentially not enough ?
+    let (tx, mut rx) = mpsc::channel::<CompletionUpdate>(500);
+
+    let worker_ref = Arc::clone(s);
+    let prompt = String::from(prompt.prompt);
+
+    thread::spawn(move || {
+        let ref mut manager = *worker_ref
+            .lock()
+            .expect("Mutex poisoned launching thread for generation");
+
+        manager
+            .infer(&prompt, move |r| match r {
+                llm::InferenceResponse::InferredToken(t) => {
+                    if let Err(_) = tx.blocking_send(CompletionUpdate {
+                        delta: t,
+                        err: None,
+                    }) {
+                        Ok(llm::InferenceFeedback::Halt)
+                    } else {
+                        Ok(llm::InferenceFeedback::Continue)
+                    }
+                }
+                _ => Ok(llm::InferenceFeedback::Continue),
+            })
+            .unwrap();
+    });
+
+    let ev_stream = EventStream! {
+        while let Some(up) = rx.recv().await {
+            yield Event::json(&up);
+        }
+    };
+
+    EventStream::from(ev_stream).heartbeat(None)
 }
